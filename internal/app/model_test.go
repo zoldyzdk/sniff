@@ -203,3 +203,112 @@ func TestModelViewShowsPortAndPIDColumns(t *testing.T) {
 		}
 	}
 }
+
+func TestModelViewShowsDetailsForSelectedRow(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{
+					Port:       3000,
+					Process:    "node",
+					PID:        1001,
+					Project:    "sniff",
+					Framework:  "Node.js",
+					Command:    "node server.js",
+					Executable: "/usr/bin/node",
+					User:       "alice",
+				},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+	view := model.View()
+	for _, val := range []string{"Details", "PID: 1001", "Command: node server.js", "Executable: /usr/bin/node", "User: alice"} {
+		if !strings.Contains(view, val) {
+			t.Fatalf("expected details view to include %q, got:\n%s", val, view)
+		}
+	}
+}
+
+func TestModelViewCompactsDetailsOnNarrowWidth(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{
+					Port:       3000,
+					Process:    "node",
+					PID:        1001,
+					Command:    "node server.js",
+					Executable: "/usr/bin/node",
+					User:       "alice",
+				},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.WindowSizeMsg{Width: 60, Height: 20})
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, "Details (compact)") {
+		t.Fatalf("expected compact details mode on narrow width, got:\n%s", view)
+	}
+}
+
+func TestModelKeepsSelectionByIdentityAcrossRefresh(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{Port: 3000, PID: 1001, Process: "node"},
+				{Port: 5173, PID: 2222, Process: "vite"},
+			},
+			{
+				{Port: 3001, PID: 3333, Process: "python"},
+				{Port: 5173, PID: 2222, Process: "vite"},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(app.Model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Runes: []rune{'r'}})
+	model = updated.(app.Model)
+	refreshMsg := runCmd(t, cmd)
+	updated, _ = model.Update(refreshMsg)
+	model = updated.(app.Model)
+
+	if model.Cursor() != 1 {
+		t.Fatalf("expected cursor to stay on selected PID identity, got %d", model.Cursor())
+	}
+}

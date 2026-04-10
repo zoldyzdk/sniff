@@ -37,6 +37,13 @@ type Model struct {
 	listeners []discovery.Listener
 	cursor    int
 	lastError error
+	width     int
+	selected  rowKey
+}
+
+type rowKey struct {
+	port int
+	pid  int
 }
 
 func NewModel(cfg Config) Model {
@@ -56,6 +63,7 @@ func NewModel(cfg Config) Model {
 		scanner:       cfg.Scanner,
 		tickEvery:     tickEvery,
 		tickScheduler: tickScheduler,
+		width:         100,
 	}
 }
 
@@ -68,6 +76,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshResultMsg:
 		m.listeners = msg.listeners
 		m.lastError = msg.err
+		m.restoreSelection()
 		if m.cursor >= len(m.listeners) {
 			if len(m.listeners) == 0 {
 				m.cursor = 0
@@ -75,9 +84,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = len(m.listeners) - 1
 			}
 		}
+		m.captureSelection()
 		return m, m.scheduleTick()
 	case AutoRefreshMsg:
 		return m, m.fetchListenersCmd()
+	case tea.WindowSizeMsg:
+		if msg.Width > 0 {
+			m.width = msg.Width
+		}
+		return m, nil
 	case tea.KeyMsg:
 		if len(msg.Runes) == 1 && msg.Runes[0] == 'r' {
 			return m, m.fetchListenersCmd()
@@ -87,10 +102,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor > 0 {
 				m.cursor--
 			}
+			m.captureSelection()
 		case "down":
 			if m.cursor < len(m.listeners)-1 {
 				m.cursor++
 			}
+			m.captureSelection()
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		}
@@ -118,6 +135,8 @@ func (m Model) View() string {
 			truncate("● "+item.Status, 11),
 		))
 	}
+	b.WriteString("\n")
+	b.WriteString(m.renderDetails())
 	if m.lastError != nil {
 		b.WriteString("\nerror: ")
 		b.WriteString(m.lastError.Error())
@@ -169,4 +188,47 @@ func (m Model) fetchListenersCmd() tea.Cmd {
 
 func (m Model) scheduleTick() tea.Cmd {
 	return m.tickScheduler(m.tickEvery)
+}
+
+func (m Model) renderDetails() string {
+	if len(m.listeners) == 0 || m.cursor < 0 || m.cursor >= len(m.listeners) {
+		return "Details\n- no row selected\n"
+	}
+	item := m.listeners[m.cursor]
+	if m.width < 80 {
+		return fmt.Sprintf(
+			"Details (compact)\nPID:%d USER:%s CMD:%s\n",
+			item.PID,
+			truncate(item.User, 10),
+			truncate(item.Command, 38),
+		)
+	}
+	return fmt.Sprintf(
+		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\n",
+		item.PID,
+		item.Command,
+		item.Executable,
+		item.User,
+	)
+}
+
+func (m *Model) captureSelection() {
+	if len(m.listeners) == 0 || m.cursor < 0 || m.cursor >= len(m.listeners) {
+		m.selected = rowKey{}
+		return
+	}
+	row := m.listeners[m.cursor]
+	m.selected = rowKey{port: row.Port, pid: row.PID}
+}
+
+func (m *Model) restoreSelection() {
+	if m.selected == (rowKey{}) {
+		return
+	}
+	for i, row := range m.listeners {
+		if row.Port == m.selected.port && row.PID == m.selected.pid {
+			m.cursor = i
+			return
+		}
+	}
 }
