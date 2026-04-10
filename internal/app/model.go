@@ -39,6 +39,7 @@ type Model struct {
 	lastError error
 	width     int
 	selected  rowKey
+	statusMsg string
 }
 
 type rowKey struct {
@@ -97,6 +98,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.Runes) == 1 && msg.Runes[0] == 'r' {
 			return m, m.fetchListenersCmd()
 		}
+		if len(msg.Runes) == 1 && msg.Runes[0] == 's' {
+			row := m.selectedRow()
+			if row != nil && row.Restricted {
+				m.statusMsg = "action blocked: rerun with elevated privileges"
+			} else {
+				m.statusMsg = "action accepted"
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "up":
 			if m.cursor > 0 {
@@ -132,11 +142,16 @@ func (m Model) View() string {
 			truncate(item.Project, 14),
 			truncate(item.Framework, 11),
 			truncate(item.Uptime, 10),
-			truncate("● "+item.Status, 11),
+			truncate(renderStatus(item), 11),
 		))
 	}
 	b.WriteString("\n")
 	b.WriteString(m.renderDetails())
+	if strings.TrimSpace(m.statusMsg) != "" {
+		b.WriteString("\n")
+		b.WriteString(m.statusMsg)
+		b.WriteString("\n")
+	}
 	if m.lastError != nil {
 		b.WriteString("\nerror: ")
 		b.WriteString(m.lastError.Error())
@@ -204,11 +219,12 @@ func (m Model) renderDetails() string {
 		)
 	}
 	return fmt.Sprintf(
-		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\n",
+		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\n%s",
 		item.PID,
 		item.Command,
 		item.Executable,
 		item.User,
+		restrictionGuidance(item),
 	)
 }
 
@@ -231,4 +247,26 @@ func (m *Model) restoreSelection() {
 			return
 		}
 	}
+}
+
+func (m Model) selectedRow() *discovery.Listener {
+	if len(m.listeners) == 0 || m.cursor < 0 || m.cursor >= len(m.listeners) {
+		return nil
+	}
+	row := m.listeners[m.cursor]
+	return &row
+}
+
+func renderStatus(item discovery.Listener) string {
+	if item.Restricted {
+		return "● locked"
+	}
+	return "● " + item.Status
+}
+
+func restrictionGuidance(item discovery.Listener) string {
+	if !item.Restricted {
+		return ""
+	}
+	return "Guidance: rerun with elevated privileges to control this process.\n"
 }

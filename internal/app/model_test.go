@@ -312,3 +312,62 @@ func TestModelKeepsSelectionByIdentityAcrossRefresh(t *testing.T) {
 		t.Fatalf("expected cursor to stay on selected PID identity, got %d", model.Cursor())
 	}
 }
+
+func TestModelRestrictedRowsRemainVisibleAndMarked(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{Port: 3000, PID: 1001, Process: "node", Restricted: false},
+				{Port: 5432, PID: 2002, Process: "postgres", Restricted: true, RestrictionReason: "owned by root"},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, ":3000") || !strings.Contains(view, ":5432") {
+		t.Fatalf("expected both unrestricted and restricted rows to be visible, got:\n%s", view)
+	}
+	if !strings.Contains(view, "locked") {
+		t.Fatalf("expected restricted process marker in view, got:\n%s", view)
+	}
+}
+
+func TestModelGuardedActionExplainsRestriction(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{Port: 5432, PID: 2002, Process: "postgres", Restricted: true, RestrictionReason: "owned by root"},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	view := model.View()
+	if !strings.Contains(view, "action blocked") {
+		t.Fatalf("expected blocked action status, got:\n%s", view)
+	}
+	if !strings.Contains(view, "rerun with elevated privileges") {
+		t.Fatalf("expected elevation guidance for restricted action, got:\n%s", view)
+	}
+}
