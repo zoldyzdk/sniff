@@ -3,10 +3,12 @@ package app_test
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/zoldyzdk/sniff/internal/action"
 	"github.com/zoldyzdk/sniff/internal/app"
 	"github.com/zoldyzdk/sniff/internal/discovery"
 )
@@ -14,6 +16,19 @@ import (
 type fakeScanner struct {
 	results [][]discovery.Listener
 	calls   int
+}
+
+type fakeStopper struct {
+	mu      sync.Mutex
+	targets []action.Target
+	result  action.Result
+}
+
+func (f *fakeStopper) GracefulStop(_ context.Context, target action.Target) action.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.targets = append(f.targets, target)
+	return f.result
 }
 
 func (f *fakeScanner) ScanListeningTCP(context.Context) ([]discovery.Listener, error) {
@@ -369,5 +384,79 @@ func TestModelGuardedActionExplainsRestriction(t *testing.T) {
 	}
 	if !strings.Contains(view, "rerun with elevated privileges") {
 		t.Fatalf("expected elevation guidance for restricted action, got:\n%s", view)
+	}
+}
+
+func TestModelStopRequiresConfirmationAndUsesSelectedTarget(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{Success: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	if strings.Contains(model.View(), "graceful stop succeeded") {
+		t.Fatalf("should not stop until confirmed")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+
+	if len(stopper.targets) != 1 {
+		t.Fatalf("expected one graceful stop call, got %d", len(stopper.targets))
+	}
+	if stopper.targets[0].PID != 1001 || stopper.targets[0].Port != 3000 {
+		t.Fatalf("unexpected stop target: %+v", stopper.targets[0])
+	}
+}
+
+func TestModelStopFlowShowsResultAndRecentHistory(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{Success: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+	view := model.View()
+	if !strings.Contains(view, "graceful stop succeeded") {
+		t.Fatalf("expected success status in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Recent actions") {
+		t.Fatalf("expected recent action section, got:\n%s", view)
+	}
+	if !strings.Contains(view, "SIGTERM pid=1001 port=3000 success") {
+		t.Fatalf("expected recorded action history, got:\n%s", view)
 	}
 }
