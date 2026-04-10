@@ -460,3 +460,56 @@ func TestModelStopFlowShowsResultAndRecentHistory(t *testing.T) {
 		t.Fatalf("expected recorded action history, got:\n%s", view)
 	}
 }
+
+func TestModelWarnsWhenStoppedPortQuicklyRebinds(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{Success: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+			{},
+			{{Port: 3000, PID: 2222, Process: "node"}},
+		},
+	}
+	now := time.Unix(1700000000, 0)
+	model := app.NewModel(app.Config{
+		Scanner:      scanner,
+		Stopper:      stopper,
+		RebindWindow: 3 * time.Second,
+		Now: func() time.Time {
+			return now
+		},
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Runes: []rune{'r'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(app.Model)
+
+	now = now.Add(1 * time.Second)
+	updated, cmd = model.Update(tea.KeyMsg{Runes: []rune{'r'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, "likely restart loop") {
+		t.Fatalf("expected quick-rebind warning, got:\n%s", view)
+	}
+	if !strings.Contains(view, "rebound :3000") {
+		t.Fatalf("expected rebound action history line, got:\n%s", view)
+	}
+}

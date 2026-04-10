@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/zoldyzdk/sniff/internal/action"
 	"github.com/zoldyzdk/sniff/internal/discovery"
+	"github.com/zoldyzdk/sniff/internal/refresh"
 )
 
 type Scanner interface {
@@ -24,6 +25,8 @@ type Stopper interface {
 type Config struct {
 	Scanner       Scanner
 	Stopper       Stopper
+	RebindWindow  time.Duration
+	Now           func() time.Time
 	TickEvery     time.Duration
 	TickScheduler TickScheduler
 }
@@ -40,6 +43,8 @@ type Model struct {
 	stopper       Stopper
 	tickEvery     time.Duration
 	tickScheduler TickScheduler
+	now           func() time.Time
+	refreshCoord  *refresh.Coordinator
 
 	listeners       []discovery.Listener
 	cursor          int
@@ -70,11 +75,17 @@ func NewModel(cfg Config) Model {
 			})
 		}
 	}
+	nowFn := cfg.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	return Model{
 		scanner:       cfg.Scanner,
 		stopper:       cfg.Stopper,
 		tickEvery:     tickEvery,
 		tickScheduler: tickScheduler,
+		now:           nowFn,
+		refreshCoord:  refresh.NewCoordinator(cfg.RebindWindow),
 		width:         100,
 	}
 }
@@ -88,6 +99,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshResultMsg:
 		m.listeners = msg.listeners
 		m.lastError = msg.err
+		m.applyRebindEvents()
 		m.restoreSelection()
 		if m.cursor >= len(m.listeners) {
 			if len(m.listeners) == 0 {
@@ -323,6 +335,9 @@ func (m *Model) applyGracefulStop() {
 		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d pending-force", m.pendingTarget.PID, m.pendingTarget.Port))
 		return
 	}
+	if m.refreshCoord != nil {
+		m.refreshCoord.MarkTargeted(m.pendingTarget.Port, m.now())
+	}
 	m.statusMsg = "graceful stop succeeded"
 	m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
 }
@@ -331,5 +346,19 @@ func (m *Model) recordAction(line string) {
 	m.history = append([]string{line}, m.history...)
 	if len(m.history) > 5 {
 		m.history = m.history[:5]
+	}
+}
+
+func (m *Model) applyRebindEvents() {
+	if m.refreshCoord == nil {
+		return
+	}
+	ev := m.refreshCoord.Observe(m.listeners, m.now())
+	if len(ev.ReboundPorts) == 0 {
+		return
+	}
+	m.statusMsg = fmt.Sprintf("warning: likely restart loop; port :%d rebound quickly", ev.ReboundPorts[0])
+	for _, port := range ev.ReboundPorts {
+		m.recordAction(fmt.Sprintf("rebound :%d detected (likely restart loop)", port))
 	}
 }
