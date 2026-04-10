@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,8 @@ type Model struct {
 	listeners []discovery.Listener
 	cursor    int
 	lastError error
+	searching bool
+	search    string
 }
 
 func NewModel(cfg Config) Model {
@@ -68,27 +71,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshResultMsg:
 		m.listeners = msg.listeners
 		m.lastError = msg.err
-		if m.cursor >= len(m.listeners) {
+		visible := m.visibleListeners()
+		if m.cursor >= len(visible) {
 			if len(m.listeners) == 0 {
 				m.cursor = 0
 			} else {
-				m.cursor = len(m.listeners) - 1
+				m.cursor = len(visible) - 1
 			}
 		}
 		return m, m.scheduleTick()
 	case AutoRefreshMsg:
 		return m, m.fetchListenersCmd()
 	case tea.KeyMsg:
+		if m.searching {
+			switch msg.String() {
+			case "esc":
+				m.searching = false
+				m.search = ""
+				m.cursor = 0
+				return m, nil
+			case "enter":
+				m.searching = false
+				return m, nil
+			case "backspace":
+				if len(m.search) > 0 {
+					m.search = m.search[:len(m.search)-1]
+				}
+				m.cursor = 0
+				return m, nil
+			}
+			if len(msg.Runes) == 1 && msg.Runes[0] >= 32 {
+				m.search += string(msg.Runes[0])
+				m.cursor = 0
+				return m, nil
+			}
+		}
+		if len(msg.Runes) == 1 && msg.Runes[0] == '/' {
+			m.searching = true
+			return m, nil
+		}
 		if len(msg.Runes) == 1 && msg.Runes[0] == 'r' {
 			return m, m.fetchListenersCmd()
 		}
+		visible := m.visibleListeners()
 		switch msg.String() {
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
 			}
 		case "down":
-			if m.cursor < len(m.listeners)-1 {
+			if m.cursor < len(visible)-1 {
 				m.cursor++
 			}
 		case "ctrl+c", "q":
@@ -100,9 +132,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Search: %s\n", m.search))
 	b.WriteString(fmt.Sprintf("%-7s %-18s %-7s %-14s %-11s %-10s %-11s\n",
 		"PORT", "PROCESS", "PID", "PROJECT", "FRAMEWORK", "UPTIME", "STATUS"))
-	for i, item := range m.listeners {
+	visible := m.visibleListeners()
+	for i, item := range visible {
 		prefix := "  "
 		if i == m.cursor {
 			prefix = "> "
@@ -123,7 +157,11 @@ func (m Model) View() string {
 		b.WriteString(m.lastError.Error())
 		b.WriteRune('\n')
 	}
-	b.WriteString("\n[up/down] navigate  [r] refresh  [q] quit\n")
+	if m.searching {
+		b.WriteString("\n[up/down] navigate  [type] filter  [backspace] delete  [esc] clear  [q] quit\n")
+	} else {
+		b.WriteString("\n[up/down] navigate  [/] search  [r] refresh  [q] quit\n")
+	}
 	return b.String()
 }
 
@@ -169,4 +207,21 @@ func (m Model) fetchListenersCmd() tea.Cmd {
 
 func (m Model) scheduleTick() tea.Cmd {
 	return m.tickScheduler(m.tickEvery)
+}
+
+func (m Model) visibleListeners() []discovery.Listener {
+	if strings.TrimSpace(m.search) == "" {
+		return m.listeners
+	}
+	query := strings.ToLower(strings.TrimSpace(m.search))
+	filtered := make([]discovery.Listener, 0, len(m.listeners))
+	for _, l := range m.listeners {
+		if strings.Contains(strings.ToLower(strconv.Itoa(l.Port)), query) ||
+			strings.Contains(strings.ToLower(l.Process), query) ||
+			strings.Contains(strings.ToLower(l.Command), query) ||
+			strings.Contains(strings.ToLower(l.Executable), query) {
+			filtered = append(filtered, l)
+		}
+	}
+	return filtered
 }

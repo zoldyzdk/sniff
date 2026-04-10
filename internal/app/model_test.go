@@ -203,3 +203,82 @@ func TestModelViewShowsPortAndPIDColumns(t *testing.T) {
 		}
 	}
 }
+
+func TestModelSearchFiltersByPortProcessAndExecutable(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{
+					Port:       3000,
+					Process:    "node",
+					PID:        1001,
+					Command:    "node server.js",
+					Executable: "/usr/bin/node",
+				},
+				{
+					Port:       5173,
+					Process:    "vite",
+					PID:        2002,
+					Command:    "vite dev",
+					Executable: "/home/me/.local/bin/vite",
+				},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'/'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'5'}})
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, "Search: 5") {
+		t.Fatalf("expected search query in header, got:\n%s", view)
+	}
+	if !strings.Contains(view, ":5173") {
+		t.Fatalf("expected filtered row by port, got:\n%s", view)
+	}
+	if strings.Contains(view, ":3000") {
+		t.Fatalf("expected non-matching row to be filtered out, got:\n%s", view)
+	}
+}
+
+func TestModelFooterHelpReflectsSearchState(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	normal := model.View()
+	if !strings.Contains(normal, "[/] search") {
+		t.Fatalf("expected normal help footer to include search shortcut, got:\n%s", normal)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'/'}})
+	model = updated.(app.Model)
+	searching := model.View()
+	if !strings.Contains(searching, "[esc] clear") {
+		t.Fatalf("expected search-mode help footer to include clear shortcut, got:\n%s", searching)
+	}
+}
