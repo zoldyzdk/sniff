@@ -16,16 +16,17 @@ import (
 )
 
 type Listener struct {
-	Port       int
-	Process    string
-	PID        int
-	Command    string
-	Executable string
-	User       string
-	Project    string
-	Framework  string
-	Uptime     string
-	Status     string
+	Port          int
+	Process       string
+	PID           int
+	Command       string
+	Executable    string
+	User          string
+	ContainerHint string
+	Project       string
+	Framework     string
+	Uptime        string
+	Status        string
 }
 
 type ProcScanner struct {
@@ -67,16 +68,17 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 		}
 		meta := readProcessMeta(s.procRoot, pid)
 		listeners = append(listeners, Listener{
-			Port:       port,
-			Process:    meta.process,
-			PID:        pid,
-			Command:    meta.command,
-			Executable: meta.executable,
-			User:       meta.user,
-			Project:    meta.project,
-			Framework:  meta.framework,
-			Uptime:     meta.uptime,
-			Status:     "healthy",
+			Port:          port,
+			Process:       meta.process,
+			PID:           pid,
+			Command:       meta.command,
+			Executable:    meta.executable,
+			User:          meta.user,
+			ContainerHint: meta.containerHint,
+			Project:       meta.project,
+			Framework:     meta.framework,
+			Uptime:        meta.uptime,
+			Status:        "healthy",
 		})
 	}
 
@@ -90,24 +92,26 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 }
 
 type processMeta struct {
-	process    string
-	command    string
-	executable string
-	user       string
-	project    string
-	framework  string
-	uptime     string
+	process       string
+	command       string
+	executable    string
+	user          string
+	containerHint string
+	project       string
+	framework     string
+	uptime        string
 }
 
 func readProcessMeta(procRoot string, pid int) processMeta {
 	meta := processMeta{
-		process:    "unknown",
-		command:    "-",
-		executable: "-",
-		user:       "-",
-		project:    "-",
-		framework:  "-",
-		uptime:     "-",
+		process:       "unknown",
+		command:       "-",
+		executable:    "-",
+		user:          "-",
+		containerHint: "",
+		project:       "-",
+		framework:     "-",
+		uptime:        "-",
 	}
 
 	pidStr := strconv.Itoa(pid)
@@ -148,7 +152,23 @@ func readProcessMeta(procRoot string, pid int) processMeta {
 			meta.user = strconv.FormatUint(uint64(stat.Uid), 10)
 		}
 	}
+	meta.containerHint = detectContainerHint(procRoot, pidStr, meta.process, cmdline)
 	return meta
+}
+
+func detectContainerHint(procRoot, pid, process, cmdline string) string {
+	cgroupPath := filepath.Join(procRoot, pid, "cgroup")
+	if raw, err := os.ReadFile(cgroupPath); err == nil {
+		line := strings.ToLower(string(raw))
+		if strings.Contains(line, "docker") || strings.Contains(line, "containerd") {
+			return "docker"
+		}
+	}
+	joined := strings.ToLower(process + " " + cmdline)
+	if strings.Contains(joined, "docker") || strings.Contains(joined, "containerd") {
+		return "docker"
+	}
+	return ""
 }
 
 func detectFramework(s string) string {

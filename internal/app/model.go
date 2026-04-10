@@ -127,7 +127,7 @@ func (m Model) View() string {
 		b.WriteString(fmt.Sprintf("%s%-7s %-18s %-7d %-14s %-11s %-10s %-11s\n",
 			prefix,
 			fmt.Sprintf(":%d", item.Port),
-			truncate(item.Process, 18),
+			truncate(renderProcess(item), 18),
 			item.PID,
 			truncate(item.Project, 14),
 			truncate(item.Framework, 11),
@@ -204,11 +204,12 @@ func (m Model) renderDetails() string {
 		)
 	}
 	return fmt.Sprintf(
-		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\n",
+		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\nContainer: %s\n",
 		item.PID,
 		item.Command,
 		item.Executable,
 		item.User,
+		containerHintDisplay(item.ContainerHint),
 	)
 }
 
@@ -231,4 +232,18 @@ func (m *Model) restoreSelection() {
 			return
 		}
 	}
+}
+
+func renderProcess(item discovery.Listener) string {
+	if strings.TrimSpace(item.ContainerHint) == "" {
+		return item.Process
+	}
+	return item.Process + " (" + item.ContainerHint + ")"
+}
+
+func containerHintDisplay(hint string) string {
+	if strings.TrimSpace(hint) == "" {
+		return "-"
+	}
+	return hint
 }
