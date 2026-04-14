@@ -20,6 +20,7 @@ type TickScheduler func(d time.Duration) tea.Cmd
 
 type Stopper interface {
 	GracefulStop(ctx context.Context, target action.Target) action.Result
+	ForceStop(ctx context.Context, target action.Target) error
 }
 
 type Config struct {
@@ -42,17 +43,19 @@ type Model struct {
 	tickEvery     time.Duration
 	tickScheduler TickScheduler
 
-	listeners       []discovery.Listener
-	cursor          int
-	lastError       error
-	width           int
-	selected        rowKey
-	statusMsg       string
-	awaitingConfirm bool
-	pendingTarget   action.Target
-	history         []string
-	searching       bool
-	search          string
+	listeners            []discovery.Listener
+	cursor               int
+	lastError            error
+	width                int
+	selected             rowKey
+	statusMsg            string
+	awaitingConfirm      bool
+	pendingTarget        action.Target
+	history              []string
+	forceAvailable       bool
+	awaitingForceConfirm bool
+	searching            bool
+	search               string
 }
 
 type rowKey struct {
@@ -151,6 +154,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+		if m.awaitingForceConfirm {
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'y' {
+				m.applyForceStop()
+				return m, nil
+			}
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'n' {
+				m.awaitingForceConfirm = false
+				m.statusMsg = "force kill cancelled"
+				return m, nil
+			}
+		}
 		if len(msg.Runes) == 1 && msg.Runes[0] == 's' {
 			row := m.selectedRow()
 			if row != nil && row.Restricted {
@@ -162,6 +176,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMsg = fmt.Sprintf("confirm graceful stop for pid=%d on :%d [y/n]", row.PID, row.Port)
 				}
 			}
+			return m, nil
+		}
+		if len(msg.Runes) == 1 && msg.Runes[0] == 'f' && m.forceAvailable {
+			m.awaitingForceConfirm = true
+			m.statusMsg = "force kill is destructive, confirm [y/n]"
 			return m, nil
 		}
 		visible := m.visibleListeners()
@@ -357,10 +376,12 @@ func (m *Model) applyGracefulStop() {
 		return
 	}
 	if result.NeedsForce {
-		m.statusMsg = "graceful stop incomplete: port still bound"
+		m.statusMsg = "graceful stop incomplete: port still bound (press [f] to force kill)"
+		m.forceAvailable = true
 		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d pending-force", m.pendingTarget.PID, m.pendingTarget.Port))
 		return
 	}
+	m.forceAvailable = false
 	m.statusMsg = "graceful stop succeeded"
 	m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
 }
@@ -370,6 +391,24 @@ func (m *Model) recordAction(line string) {
 	if len(m.history) > 5 {
 		m.history = m.history[:5]
 	}
+}
+
+func (m *Model) applyForceStop() {
+	m.awaitingForceConfirm = false
+	if m.stopper == nil {
+		m.statusMsg = "force kill succeeded"
+		m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+		m.forceAvailable = false
+		return
+	}
+	if err := m.stopper.ForceStop(context.Background(), m.pendingTarget); err != nil {
+		m.statusMsg = "force kill failed"
+		m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d error", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	m.statusMsg = "force kill succeeded"
+	m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+	m.forceAvailable = false
 }
 
 func (m Model) visibleListeners() []discovery.Listener {

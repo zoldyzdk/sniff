@@ -19,9 +19,10 @@ type fakeScanner struct {
 }
 
 type fakeStopper struct {
-	mu      sync.Mutex
-	targets []action.Target
-	result  action.Result
+	mu         sync.Mutex
+	targets    []action.Target
+	forceCalls []action.Target
+	result     action.Result
 }
 
 func (f *fakeStopper) GracefulStop(_ context.Context, target action.Target) action.Result {
@@ -29,6 +30,13 @@ func (f *fakeStopper) GracefulStop(_ context.Context, target action.Target) acti
 	defer f.mu.Unlock()
 	f.targets = append(f.targets, target)
 	return f.result
+}
+
+func (f *fakeStopper) ForceStop(_ context.Context, target action.Target) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forceCalls = append(f.forceCalls, target)
+	return nil
 }
 
 func (f *fakeScanner) ScanListeningTCP(context.Context) ([]discovery.Listener, error) {
@@ -461,6 +469,85 @@ func TestModelStopFlowShowsResultAndRecentHistory(t *testing.T) {
 	}
 	if !strings.Contains(view, "SIGTERM pid=1001 port=3000 success") {
 		t.Fatalf("expected recorded action history, got:\n%s", view)
+	}
+}
+
+func TestModelOffersExplicitForcePathAfterGracefulNeedsForce(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{NeedsForce: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+	view := model.View()
+	if !strings.Contains(view, "graceful stop incomplete") {
+		t.Fatalf("expected graceful-stop failure status, got:\n%s", view)
+	}
+	if !strings.Contains(view, "press [f] to force kill") {
+		t.Fatalf("expected explicit force path hint, got:\n%s", view)
+	}
+}
+
+func TestModelForceKillRequiresOwnConfirmation(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{NeedsForce: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'f'}})
+	model = updated.(app.Model)
+	if len(stopper.forceCalls) != 0 {
+		t.Fatalf("expected no force call before confirmation")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+	if len(stopper.forceCalls) != 1 {
+		t.Fatalf("expected exactly one force call, got %d", len(stopper.forceCalls))
+	}
+	view := model.View()
+	if !strings.Contains(view, "force kill succeeded") {
+		t.Fatalf("expected force result message in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "SIGKILL pid=1001 port=3000 success") {
+		t.Fatalf("expected force action history entry, got:\n%s", view)
 	}
 }
 
