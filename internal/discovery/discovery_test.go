@@ -146,3 +146,41 @@ func TestProcScannerScanListeningTCP_EnrichesProcessMetadata(t *testing.T) {
 		t.Fatalf("expected minute-scale uptime, got %q", row.Uptime)
 	}
 }
+
+func TestProcScannerScanListeningTCP_LabelsDockerRelatedProcess(t *testing.T) {
+	procRoot := t.TempDir()
+	tcpContent := `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1770 00000000:0000 0A 00000000:00000000 00:00000000 00000000   1000        0 70000 1 0000000000000000 100 0 0 10 0
+`
+	if err := os.MkdirAll(filepath.Join(procRoot, "net"), 0o755); err != nil {
+		t.Fatalf("mkdir net: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(procRoot, "net", "tcp"), []byte(tcpContent), 0o644); err != nil {
+		t.Fatalf("write tcp: %v", err)
+	}
+	pidDir := filepath.Join(procRoot, "333")
+	if err := os.MkdirAll(filepath.Join(pidDir, "fd"), 0o755); err != nil {
+		t.Fatalf("mkdir pid fd: %v", err)
+	}
+	if err := os.Symlink("socket:[70000]", filepath.Join(pidDir, "fd", "3")); err != nil {
+		t.Fatalf("symlink socket fd: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pidDir, "comm"), []byte("containerd-shim\n"), 0o644); err != nil {
+		t.Fatalf("write comm: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pidDir, "cgroup"), []byte("0::/system.slice/docker-abc.scope\n"), 0o644); err != nil {
+		t.Fatalf("write cgroup: %v", err)
+	}
+
+	scanner := NewProcScanner(procRoot)
+	got, err := scanner.ScanListeningTCP(context.Background())
+	if err != nil {
+		t.Fatalf("scan listening tcp: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one listener, got %d", len(got))
+	}
+	if got[0].ContainerHint != "docker" {
+		t.Fatalf("expected docker container hint, got %q", got[0].ContainerHint)
+	}
+}

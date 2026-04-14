@@ -298,6 +298,36 @@ func TestModelViewCompactsDetailsOnNarrowWidth(t *testing.T) {
 	}
 }
 
+func TestModelViewShowsDockerHintWhenPresent(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{
+					Port:          8080,
+					Process:       "node",
+					PID:           2222,
+					ContainerHint: "docker",
+				},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, "docker") {
+		t.Fatalf("expected docker label in rendered view, got:\n%s", view)
+	}
+}
+
 func TestModelKeepsSelectionByIdentityAcrossRefresh(t *testing.T) {
 	scanner := &fakeScanner{
 		results: [][]discovery.Listener{
