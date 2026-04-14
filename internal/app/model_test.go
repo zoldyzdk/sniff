@@ -3,10 +3,12 @@ package app_test
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/zoldyzdk/sniff/internal/action"
 	"github.com/zoldyzdk/sniff/internal/app"
 	"github.com/zoldyzdk/sniff/internal/discovery"
 )
@@ -14,6 +16,27 @@ import (
 type fakeScanner struct {
 	results [][]discovery.Listener
 	calls   int
+}
+
+type fakeStopper struct {
+	mu         sync.Mutex
+	targets    []action.Target
+	forceCalls []action.Target
+	result     action.Result
+}
+
+func (f *fakeStopper) GracefulStop(_ context.Context, target action.Target) action.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.targets = append(f.targets, target)
+	return f.result
+}
+
+func (f *fakeStopper) ForceStop(_ context.Context, target action.Target) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forceCalls = append(f.forceCalls, target)
+	return nil
 }
 
 func (f *fakeScanner) ScanListeningTCP(context.Context) ([]discovery.Listener, error) {
@@ -340,5 +363,355 @@ func TestModelKeepsSelectionByIdentityAcrossRefresh(t *testing.T) {
 
 	if model.Cursor() != 1 {
 		t.Fatalf("expected cursor to stay on selected PID identity, got %d", model.Cursor())
+	}
+}
+
+func TestModelRestrictedRowsRemainVisibleAndMarked(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{Port: 3000, PID: 1001, Process: "node", Restricted: false},
+				{Port: 5432, PID: 2002, Process: "postgres", Restricted: true, RestrictionReason: "owned by root"},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, ":3000") || !strings.Contains(view, ":5432") {
+		t.Fatalf("expected both unrestricted and restricted rows to be visible, got:\n%s", view)
+	}
+	if !strings.Contains(view, "locked") {
+		t.Fatalf("expected restricted process marker in view, got:\n%s", view)
+	}
+}
+
+func TestModelGuardedActionExplainsRestriction(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{Port: 5432, PID: 2002, Process: "postgres", Restricted: true, RestrictionReason: "owned by root"},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	view := model.View()
+	if !strings.Contains(view, "action blocked") {
+		t.Fatalf("expected blocked action status, got:\n%s", view)
+	}
+	if !strings.Contains(view, "rerun with elevated privileges") {
+		t.Fatalf("expected elevation guidance for restricted action, got:\n%s", view)
+	}
+}
+
+func TestModelStopRequiresConfirmationAndUsesSelectedTarget(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{Success: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	if strings.Contains(model.View(), "graceful stop succeeded") {
+		t.Fatalf("should not stop until confirmed")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+
+	if len(stopper.targets) != 1 {
+		t.Fatalf("expected one graceful stop call, got %d", len(stopper.targets))
+	}
+	if stopper.targets[0].PID != 1001 || stopper.targets[0].Port != 3000 {
+		t.Fatalf("unexpected stop target: %+v", stopper.targets[0])
+	}
+}
+
+func TestModelStopFlowShowsResultAndRecentHistory(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{Success: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+	view := model.View()
+	if !strings.Contains(view, "graceful stop succeeded") {
+		t.Fatalf("expected success status in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Recent actions") {
+		t.Fatalf("expected recent action section, got:\n%s", view)
+	}
+	if !strings.Contains(view, "SIGTERM pid=1001 port=3000 success") {
+		t.Fatalf("expected recorded action history, got:\n%s", view)
+	}
+}
+
+func TestModelWarnsWhenStoppedPortQuicklyRebinds(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{Success: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+			{},
+			{{Port: 3000, PID: 2222, Process: "node"}},
+		},
+	}
+	now := time.Unix(1700000000, 0)
+	model := app.NewModel(app.Config{
+		Scanner:      scanner,
+		Stopper:      stopper,
+		RebindWindow: 3 * time.Second,
+		Now: func() time.Time {
+			return now
+		},
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+
+	updated, cmd := model.Update(tea.KeyMsg{Runes: []rune{'r'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(app.Model)
+
+	now = now.Add(1 * time.Second)
+	updated, cmd = model.Update(tea.KeyMsg{Runes: []rune{'r'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(runCmd(t, cmd))
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, "likely restart loop") {
+		t.Fatalf("expected quick-rebind warning, got:\n%s", view)
+	}
+	if !strings.Contains(view, "rebound :3000") {
+		t.Fatalf("expected rebound action history line, got:\n%s", view)
+	}
+}
+
+func TestModelOffersExplicitForcePathAfterGracefulNeedsForce(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{NeedsForce: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+	view := model.View()
+	if !strings.Contains(view, "graceful stop incomplete") {
+		t.Fatalf("expected graceful-stop failure status, got:\n%s", view)
+	}
+	if !strings.Contains(view, "press [f] to force kill") {
+		t.Fatalf("expected explicit force path hint, got:\n%s", view)
+	}
+}
+
+func TestModelForceKillRequiresOwnConfirmation(t *testing.T) {
+	stopper := &fakeStopper{
+		result: action.Result{NeedsForce: true},
+	}
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		Stopper:   stopper,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'s'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'f'}})
+	model = updated.(app.Model)
+	if len(stopper.forceCalls) != 0 {
+		t.Fatalf("expected no force call before confirmation")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'y'}})
+	model = updated.(app.Model)
+	if len(stopper.forceCalls) != 1 {
+		t.Fatalf("expected exactly one force call, got %d", len(stopper.forceCalls))
+	}
+	view := model.View()
+	if !strings.Contains(view, "force kill succeeded") {
+		t.Fatalf("expected force result message in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "SIGKILL pid=1001 port=3000 success") {
+		t.Fatalf("expected force action history entry, got:\n%s", view)
+	}
+}
+
+func TestModelSearchFiltersByPortProcessAndExecutable(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{
+				{
+					Port:       3000,
+					Process:    "node",
+					PID:        1001,
+					Command:    "node server.js",
+					Executable: "/usr/bin/node",
+				},
+				{
+					Port:       5173,
+					Process:    "vite",
+					PID:        2002,
+					Command:    "vite dev",
+					Executable: "/home/me/.local/bin/vite",
+				},
+			},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'/'}})
+	model = updated.(app.Model)
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'5'}})
+	model = updated.(app.Model)
+
+	view := model.View()
+	if !strings.Contains(view, "Search: 5") {
+		t.Fatalf("expected search query in header, got:\n%s", view)
+	}
+	if !strings.Contains(view, ":5173") {
+		t.Fatalf("expected filtered row by port, got:\n%s", view)
+	}
+	if strings.Contains(view, ":3000") {
+		t.Fatalf("expected non-matching row to be filtered out, got:\n%s", view)
+	}
+}
+
+func TestModelFooterHelpReflectsSearchState(t *testing.T) {
+	scanner := &fakeScanner{
+		results: [][]discovery.Listener{
+			{{Port: 3000, PID: 1001, Process: "node"}},
+		},
+	}
+	model := app.NewModel(app.Config{
+		Scanner:   scanner,
+		TickEvery: time.Second,
+		TickScheduler: func(time.Duration) tea.Cmd {
+			return nil
+		},
+	})
+
+	initMsg := runCmd(t, model.Init())
+	updated, _ := model.Update(initMsg)
+	model = updated.(app.Model)
+
+	normal := model.View()
+	if !strings.Contains(normal, "[/] search") {
+		t.Fatalf("expected normal help footer to include search shortcut, got:\n%s", normal)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Runes: []rune{'/'}})
+	model = updated.(app.Model)
+	searching := model.View()
+	if !strings.Contains(searching, "[esc] clear") {
+		t.Fatalf("expected search-mode help footer to include clear shortcut, got:\n%s", searching)
 	}
 }

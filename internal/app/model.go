@@ -3,11 +3,14 @@ package app
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/zoldyzdk/sniff/internal/action"
 	"github.com/zoldyzdk/sniff/internal/discovery"
+	"github.com/zoldyzdk/sniff/internal/refresh"
 )
 
 type Scanner interface {
@@ -16,8 +19,16 @@ type Scanner interface {
 
 type TickScheduler func(d time.Duration) tea.Cmd
 
+type Stopper interface {
+	GracefulStop(ctx context.Context, target action.Target) action.Result
+	ForceStop(ctx context.Context, target action.Target) error
+}
+
 type Config struct {
 	Scanner       Scanner
+	Stopper       Stopper
+	RebindWindow  time.Duration
+	Now           func() time.Time
 	TickEvery     time.Duration
 	TickScheduler TickScheduler
 }
@@ -31,14 +42,25 @@ type refreshResultMsg struct {
 
 type Model struct {
 	scanner       Scanner
+	stopper       Stopper
 	tickEvery     time.Duration
 	tickScheduler TickScheduler
+	now           func() time.Time
+	refreshCoord  *refresh.Coordinator
 
-	listeners []discovery.Listener
-	cursor    int
-	lastError error
-	width     int
-	selected  rowKey
+	listeners            []discovery.Listener
+	cursor               int
+	lastError            error
+	width                int
+	selected             rowKey
+	statusMsg            string
+	awaitingConfirm      bool
+	pendingTarget        action.Target
+	history              []string
+	forceAvailable       bool
+	awaitingForceConfirm bool
+	searching            bool
+	search               string
 }
 
 type rowKey struct {
@@ -59,10 +81,17 @@ func NewModel(cfg Config) Model {
 			})
 		}
 	}
+	nowFn := cfg.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	return Model{
 		scanner:       cfg.Scanner,
+		stopper:       cfg.Stopper,
 		tickEvery:     tickEvery,
 		tickScheduler: tickScheduler,
+		now:           nowFn,
+		refreshCoord:  refresh.NewCoordinator(cfg.RebindWindow),
 		width:         100,
 	}
 }
@@ -76,12 +105,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshResultMsg:
 		m.listeners = msg.listeners
 		m.lastError = msg.err
+		m.applyRebindEvents()
 		m.restoreSelection()
-		if m.cursor >= len(m.listeners) {
+		visible := m.visibleListeners()
+		if m.cursor >= len(visible) {
 			if len(m.listeners) == 0 {
 				m.cursor = 0
 			} else {
-				m.cursor = len(m.listeners) - 1
+				m.cursor = len(visible) - 1
 			}
 		}
 		m.captureSelection()
@@ -94,9 +125,77 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if m.searching {
+			switch msg.String() {
+			case "esc":
+				m.searching = false
+				m.search = ""
+				m.cursor = 0
+				return m, nil
+			case "enter":
+				m.searching = false
+				return m, nil
+			case "backspace":
+				if len(m.search) > 0 {
+					m.search = m.search[:len(m.search)-1]
+				}
+				m.cursor = 0
+				return m, nil
+			}
+			if len(msg.Runes) == 1 && msg.Runes[0] >= 32 {
+				m.search += string(msg.Runes[0])
+				m.cursor = 0
+				return m, nil
+			}
+		}
+		if len(msg.Runes) == 1 && msg.Runes[0] == '/' {
+			m.searching = true
+			return m, nil
+		}
 		if len(msg.Runes) == 1 && msg.Runes[0] == 'r' {
 			return m, m.fetchListenersCmd()
 		}
+		if m.awaitingConfirm {
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'y' {
+				m.applyGracefulStop()
+				return m, nil
+			}
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'n' {
+				m.awaitingConfirm = false
+				m.statusMsg = "graceful stop cancelled"
+				return m, nil
+			}
+		}
+		if m.awaitingForceConfirm {
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'y' {
+				m.applyForceStop()
+				return m, nil
+			}
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'n' {
+				m.awaitingForceConfirm = false
+				m.statusMsg = "force kill cancelled"
+				return m, nil
+			}
+		}
+		if len(msg.Runes) == 1 && msg.Runes[0] == 's' {
+			row := m.selectedRow()
+			if row != nil && row.Restricted {
+				m.statusMsg = "action blocked: rerun with elevated privileges"
+			} else {
+				m.awaitingConfirm = true
+				if row != nil {
+					m.pendingTarget = action.Target{PID: row.PID, Port: row.Port}
+					m.statusMsg = fmt.Sprintf("confirm graceful stop for pid=%d on :%d [y/n]", row.PID, row.Port)
+				}
+			}
+			return m, nil
+		}
+		if len(msg.Runes) == 1 && msg.Runes[0] == 'f' && m.forceAvailable {
+			m.awaitingForceConfirm = true
+			m.statusMsg = "force kill is destructive, confirm [y/n]"
+			return m, nil
+		}
+		visible := m.visibleListeners()
 		switch msg.String() {
 		case "up":
 			if m.cursor > 0 {
@@ -104,7 +203,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.captureSelection()
 		case "down":
-			if m.cursor < len(m.listeners)-1 {
+			if m.cursor < len(visible)-1 {
 				m.cursor++
 			}
 			m.captureSelection()
@@ -117,9 +216,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Search: %s\n", m.search))
 	b.WriteString(fmt.Sprintf("%-7s %-18s %-7s %-14s %-11s %-10s %-11s\n",
 		"PORT", "PROCESS", "PID", "PROJECT", "FRAMEWORK", "UPTIME", "STATUS"))
-	for i, item := range m.listeners {
+	visible := m.visibleListeners()
+	for i, item := range visible {
 		prefix := "  "
 		if i == m.cursor {
 			prefix = "> "
@@ -132,17 +233,34 @@ func (m Model) View() string {
 			truncate(item.Project, 14),
 			truncate(item.Framework, 11),
 			truncate(item.Uptime, 10),
-			truncate("● "+item.Status, 11),
+			truncate(renderStatus(item), 11),
 		))
 	}
 	b.WriteString("\n")
 	b.WriteString(m.renderDetails())
+	if strings.TrimSpace(m.statusMsg) != "" {
+		b.WriteString("\n")
+		b.WriteString(m.statusMsg)
+		b.WriteString("\n")
+	}
+	if len(m.history) > 0 {
+		b.WriteString("\nRecent actions\n")
+		for _, line := range m.history {
+			b.WriteString("- ")
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
 	if m.lastError != nil {
 		b.WriteString("\nerror: ")
 		b.WriteString(m.lastError.Error())
 		b.WriteRune('\n')
 	}
-	b.WriteString("\n[up/down] navigate  [r] refresh  [q] quit\n")
+	if m.searching {
+		b.WriteString("\n[up/down] navigate  [type] filter  [backspace] delete  [esc] clear  [q] quit\n")
+	} else {
+		b.WriteString("\n[up/down] navigate  [/] search  [r] refresh  [q] quit\n")
+	}
 	return b.String()
 }
 
@@ -204,12 +322,13 @@ func (m Model) renderDetails() string {
 		)
 	}
 	return fmt.Sprintf(
-		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\nContainer: %s\n",
+		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\nContainer: %s\n%s",
 		item.PID,
 		item.Command,
 		item.Executable,
 		item.User,
 		containerHintDisplay(item.ContainerHint),
+		restrictionGuidance(item),
 	)
 }
 
@@ -246,4 +365,109 @@ func containerHintDisplay(hint string) string {
 		return "-"
 	}
 	return hint
+}
+
+func (m Model) selectedRow() *discovery.Listener {
+	if len(m.listeners) == 0 || m.cursor < 0 || m.cursor >= len(m.listeners) {
+		return nil
+	}
+	row := m.listeners[m.cursor]
+	return &row
+}
+
+func renderStatus(item discovery.Listener) string {
+	if item.Restricted {
+		return "● locked"
+	}
+	return "● " + item.Status
+}
+
+func restrictionGuidance(item discovery.Listener) string {
+	if !item.Restricted {
+		return ""
+	}
+	return "Guidance: rerun with elevated privileges to control this process.\n"
+}
+
+func (m *Model) applyGracefulStop() {
+	m.awaitingConfirm = false
+	if m.stopper == nil {
+		m.statusMsg = "graceful stop succeeded"
+		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	result := m.stopper.GracefulStop(context.Background(), m.pendingTarget)
+	if result.Err != nil {
+		m.statusMsg = "graceful stop failed"
+		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d error", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	if result.NeedsForce {
+		m.statusMsg = "graceful stop incomplete: port still bound (press [f] to force kill)"
+		m.forceAvailable = true
+		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d pending-force", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	if m.refreshCoord != nil {
+		m.refreshCoord.MarkTargeted(m.pendingTarget.Port, m.now())
+	}
+	m.forceAvailable = false
+	m.statusMsg = "graceful stop succeeded"
+	m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+}
+
+func (m *Model) recordAction(line string) {
+	m.history = append([]string{line}, m.history...)
+	if len(m.history) > 5 {
+		m.history = m.history[:5]
+	}
+}
+
+func (m *Model) applyRebindEvents() {
+	if m.refreshCoord == nil {
+		return
+	}
+	ev := m.refreshCoord.Observe(m.listeners, m.now())
+	if len(ev.ReboundPorts) == 0 {
+		return
+	}
+	m.statusMsg = fmt.Sprintf("warning: likely restart loop; port :%d rebound quickly", ev.ReboundPorts[0])
+	for _, port := range ev.ReboundPorts {
+		m.recordAction(fmt.Sprintf("rebound :%d detected (likely restart loop)", port))
+	}
+}
+
+func (m *Model) applyForceStop() {
+	m.awaitingForceConfirm = false
+	if m.stopper == nil {
+		m.statusMsg = "force kill succeeded"
+		m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+		m.forceAvailable = false
+		return
+	}
+	if err := m.stopper.ForceStop(context.Background(), m.pendingTarget); err != nil {
+		m.statusMsg = "force kill failed"
+		m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d error", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	m.statusMsg = "force kill succeeded"
+	m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+	m.forceAvailable = false
+}
+
+func (m Model) visibleListeners() []discovery.Listener {
+	if strings.TrimSpace(m.search) == "" {
+		return m.listeners
+	}
+	query := strings.ToLower(strings.TrimSpace(m.search))
+	filtered := make([]discovery.Listener, 0, len(m.listeners))
+	for _, l := range m.listeners {
+		if strings.Contains(strings.ToLower(strconv.Itoa(l.Port)), query) ||
+			strings.Contains(strings.ToLower(l.Process), query) ||
+			strings.Contains(strings.ToLower(l.Command), query) ||
+			strings.Contains(strings.ToLower(l.Executable), query) {
+			filtered = append(filtered, l)
+		}
+	}
+	return filtered
 }
