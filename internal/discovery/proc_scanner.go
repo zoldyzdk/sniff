@@ -16,16 +16,18 @@ import (
 )
 
 type Listener struct {
-	Port       int
-	Process    string
-	PID        int
-	Command    string
-	Executable string
-	User       string
-	Project    string
-	Framework  string
-	Uptime     string
-	Status     string
+	Port              int
+	Process           string
+	PID               int
+	Command           string
+	Executable        string
+	User              string
+	Project           string
+	Framework         string
+	Uptime            string
+	Status            string
+	Restricted        bool
+	RestrictionReason string
 }
 
 type ProcScanner struct {
@@ -65,16 +67,18 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 		}
 		meta := readProcessMeta(s.procRoot, pid)
 		listeners = append(listeners, Listener{
-			Port:       port,
-			Process:    meta.process,
-			PID:        pid,
-			Command:    meta.command,
-			Executable: meta.executable,
-			User:       meta.user,
-			Project:    meta.project,
-			Framework:  meta.framework,
-			Uptime:     meta.uptime,
-			Status:     "healthy",
+			Port:              port,
+			Process:           meta.process,
+			PID:               pid,
+			Command:           meta.command,
+			Executable:        meta.executable,
+			User:              meta.user,
+			Project:           meta.project,
+			Framework:         meta.framework,
+			Uptime:            meta.uptime,
+			Status:            "healthy",
+			Restricted:        meta.restricted,
+			RestrictionReason: meta.restrictionReason,
 		})
 	}
 
@@ -88,24 +92,28 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 }
 
 type processMeta struct {
-	process    string
-	command    string
-	executable string
-	user       string
-	project    string
-	framework  string
-	uptime     string
+	process           string
+	command           string
+	executable        string
+	user              string
+	restricted        bool
+	restrictionReason string
+	project           string
+	framework         string
+	uptime            string
 }
 
 func readProcessMeta(procRoot string, pid int) processMeta {
 	meta := processMeta{
-		process:    "unknown",
-		command:    "-",
-		executable: "-",
-		user:       "-",
-		project:    "-",
-		framework:  "-",
-		uptime:     "-",
+		process:           "unknown",
+		command:           "-",
+		executable:        "-",
+		user:              "-",
+		restricted:        false,
+		restrictionReason: "",
+		project:           "-",
+		framework:         "-",
+		uptime:            "-",
 	}
 
 	pidStr := strconv.Itoa(pid)
@@ -144,6 +152,10 @@ func readProcessMeta(procRoot string, pid int) processMeta {
 	if info, err := os.Stat(filepath.Join(procRoot, pidStr)); err == nil {
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 			meta.user = strconv.FormatUint(uint64(stat.Uid), 10)
+			if os.Geteuid() != 0 && int(stat.Uid) != os.Geteuid() {
+				meta.restricted = true
+				meta.restrictionReason = "owned by a different user"
+			}
 		}
 	}
 	return meta
