@@ -61,6 +61,7 @@ type Model struct {
 	awaitingForceConfirm bool
 	searching            bool
 	search               string
+	theme                theme
 }
 
 type rowKey struct {
@@ -93,6 +94,7 @@ func NewModel(cfg Config) Model {
 		now:           nowFn,
 		refreshCoord:  refresh.NewCoordinator(cfg.RebindWindow),
 		width:         100,
+		theme:         defaultTheme(),
 	}
 }
 
@@ -216,16 +218,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Search: %s\n", m.search))
-	b.WriteString(fmt.Sprintf("%-7s %-18s %-7s %-14s %-11s %-10s %-11s\n",
-		"PORT", "PROCESS", "PID", "PROJECT", "FRAMEWORK", "UPTIME", "STATUS"))
+	b.WriteString(m.theme.searchLabel.Render(fmt.Sprintf("Search: %s", m.search)))
+	b.WriteString("\n")
+	b.WriteString(m.theme.header.Render(fmt.Sprintf("%-7s %-18s %-7s %-14s %-11s %-10s %-11s",
+		"PORT", "PROCESS", "PID", "PROJECT", "FRAMEWORK", "UPTIME", "STATUS")))
+	b.WriteString("\n")
 	visible := m.visibleListeners()
 	for i, item := range visible {
 		prefix := "  "
 		if i == m.cursor {
 			prefix = "> "
 		}
-		b.WriteString(fmt.Sprintf("%s%-7s %-18s %-7d %-14s %-11s %-10s %-11s\n",
+		row := fmt.Sprintf("%s%-7s %-18s %-7d %-14s %-11s %-10s %-11s",
 			prefix,
 			fmt.Sprintf(":%d", item.Port),
 			truncate(renderProcess(item), 18),
@@ -234,13 +238,23 @@ func (m Model) View() string {
 			truncate(item.Framework, 11),
 			truncate(item.Uptime, 10),
 			truncate(renderStatus(item), 11),
-		))
+		)
+		if i == m.cursor {
+			b.WriteString(m.theme.selectedRow.Render(row))
+		} else {
+			b.WriteString(m.theme.normalRow.Render(row))
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 	b.WriteString(m.renderDetails())
 	if strings.TrimSpace(m.statusMsg) != "" {
 		b.WriteString("\n")
-		b.WriteString(m.statusMsg)
+		if strings.Contains(strings.ToLower(m.statusMsg), "warning") || strings.Contains(strings.ToLower(m.statusMsg), "blocked") {
+			b.WriteString(m.theme.warning.Render(m.statusMsg))
+		} else {
+			b.WriteString(m.theme.success.Render(m.statusMsg))
+		}
 		b.WriteString("\n")
 	}
 	if len(m.history) > 0 {
@@ -257,9 +271,13 @@ func (m Model) View() string {
 		b.WriteRune('\n')
 	}
 	if m.searching {
-		b.WriteString("\n[up/down] navigate  [type] filter  [backspace] delete  [esc] clear  [q] quit\n")
+		b.WriteString("\n")
+		b.WriteString(m.theme.footer.Render("[up/down] navigate  [type] filter  [backspace] delete  [esc] clear  [q] quit"))
+		b.WriteString("\n")
 	} else {
-		b.WriteString("\n[up/down] navigate  [/] search  [r] refresh  [q] quit\n")
+		b.WriteString("\n")
+		b.WriteString(m.theme.footer.Render("[up/down] navigate  [/] search  [r] refresh  [q] quit"))
+		b.WriteString("\n")
 	}
 	return b.String()
 }
@@ -309,20 +327,22 @@ func (m Model) scheduleTick() tea.Cmd {
 }
 
 func (m Model) renderDetails() string {
-	if len(m.listeners) == 0 || m.cursor < 0 || m.cursor >= len(m.listeners) {
+	item, ok := m.rowAtCursor()
+	if !ok {
 		return "Details\n- no row selected\n"
 	}
-	item := m.listeners[m.cursor]
 	if m.width < 80 {
 		return fmt.Sprintf(
-			"Details (compact)\nPID:%d USER:%s CMD:%s\n",
+			"%s\nPID:%d USER:%s CMD:%s\n",
+			m.theme.detailsTitle.Render("Details (compact)"),
 			item.PID,
 			truncate(item.User, 10),
 			truncate(item.Command, 38),
 		)
 	}
 	return fmt.Sprintf(
-		"Details\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\nContainer: %s\n%s",
+		"%s\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\nContainer: %s\n%s",
+		m.theme.detailsTitle.Render("Details"),
 		item.PID,
 		item.Command,
 		item.Executable,
@@ -333,11 +353,11 @@ func (m Model) renderDetails() string {
 }
 
 func (m *Model) captureSelection() {
-	if len(m.listeners) == 0 || m.cursor < 0 || m.cursor >= len(m.listeners) {
+	row, ok := m.rowAtCursor()
+	if !ok {
 		m.selected = rowKey{}
 		return
 	}
-	row := m.listeners[m.cursor]
 	m.selected = rowKey{port: row.Port, pid: row.PID}
 }
 
@@ -368,10 +388,10 @@ func containerHintDisplay(hint string) string {
 }
 
 func (m Model) selectedRow() *discovery.Listener {
-	if len(m.listeners) == 0 || m.cursor < 0 || m.cursor >= len(m.listeners) {
+	row, ok := m.rowAtCursor()
+	if !ok {
 		return nil
 	}
-	row := m.listeners[m.cursor]
 	return &row
 }
 
@@ -470,4 +490,12 @@ func (m Model) visibleListeners() []discovery.Listener {
 		}
 	}
 	return filtered
+}
+
+func (m Model) rowAtCursor() (discovery.Listener, bool) {
+	visible := m.visibleListeners()
+	if len(visible) == 0 || m.cursor < 0 || m.cursor >= len(visible) {
+		return discovery.Listener{}, false
+	}
+	return visible[m.cursor], true
 }
