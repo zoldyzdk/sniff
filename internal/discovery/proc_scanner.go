@@ -49,8 +49,6 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 			return nil, err
 		}
 		for port, inode := range tableInodes {
-			// Prefer first-seen mapping to keep deterministic output when both
-			// tables expose the same listening port.
 			if _, exists := inodesByPort[port]; !exists {
 				inodesByPort[port] = inode
 			}
