@@ -8,7 +8,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/zoldyzdk/sniff/internal/action"
 	"github.com/zoldyzdk/sniff/internal/discovery"
+	"github.com/zoldyzdk/sniff/internal/refresh"
 )
 
 type Scanner interface {
@@ -17,8 +19,16 @@ type Scanner interface {
 
 type TickScheduler func(d time.Duration) tea.Cmd
 
+type Stopper interface {
+	GracefulStop(ctx context.Context, target action.Target) action.Result
+	ForceStop(ctx context.Context, target action.Target) error
+}
+
 type Config struct {
 	Scanner       Scanner
+	Stopper       Stopper
+	RebindWindow  time.Duration
+	Now           func() time.Time
 	TickEvery     time.Duration
 	TickScheduler TickScheduler
 }
@@ -32,18 +42,26 @@ type refreshResultMsg struct {
 
 type Model struct {
 	scanner       Scanner
+	stopper       Stopper
 	tickEvery     time.Duration
 	tickScheduler TickScheduler
+	now           func() time.Time
+	refreshCoord  *refresh.Coordinator
 
-	listeners []discovery.Listener
-	cursor    int
-	lastError error
-	width     int
-	selected  rowKey
-	statusMsg string
-	searching bool
-	search    string
-	theme     theme
+	listeners            []discovery.Listener
+	cursor               int
+	lastError            error
+	width                int
+	selected             rowKey
+	statusMsg            string
+	awaitingConfirm      bool
+	pendingTarget        action.Target
+	history              []string
+	forceAvailable       bool
+	awaitingForceConfirm bool
+	searching            bool
+	search               string
+	theme                theme
 }
 
 type rowKey struct {
@@ -64,10 +82,17 @@ func NewModel(cfg Config) Model {
 			})
 		}
 	}
+	nowFn := cfg.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	return Model{
 		scanner:       cfg.Scanner,
+		stopper:       cfg.Stopper,
 		tickEvery:     tickEvery,
 		tickScheduler: tickScheduler,
+		now:           nowFn,
+		refreshCoord:  refresh.NewCoordinator(cfg.RebindWindow),
 		width:         100,
 		theme:         defaultTheme(),
 	}
@@ -82,10 +107,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshResultMsg:
 		m.listeners = msg.listeners
 		m.lastError = msg.err
+		m.applyRebindEvents()
 		m.restoreSelection()
 		visible := m.visibleListeners()
 		if m.cursor >= len(visible) {
-			if len(visible) == 0 {
+			if len(m.listeners) == 0 {
 				m.cursor = 0
 			} else {
 				m.cursor = len(visible) - 1
@@ -131,13 +157,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.Runes) == 1 && msg.Runes[0] == 'r' {
 			return m, m.fetchListenersCmd()
 		}
+		if m.awaitingConfirm {
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'y' {
+				m.applyGracefulStop()
+				return m, nil
+			}
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'n' {
+				m.awaitingConfirm = false
+				m.statusMsg = "graceful stop cancelled"
+				return m, nil
+			}
+		}
+		if m.awaitingForceConfirm {
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'y' {
+				m.applyForceStop()
+				return m, nil
+			}
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'n' {
+				m.awaitingForceConfirm = false
+				m.statusMsg = "force kill cancelled"
+				return m, nil
+			}
+		}
 		if len(msg.Runes) == 1 && msg.Runes[0] == 's' {
 			row := m.selectedRow()
 			if row != nil && row.Restricted {
 				m.statusMsg = "action blocked: rerun with elevated privileges"
 			} else {
-				m.statusMsg = "action accepted"
+				m.awaitingConfirm = true
+				if row != nil {
+					m.pendingTarget = action.Target{PID: row.PID, Port: row.Port}
+					m.statusMsg = fmt.Sprintf("confirm graceful stop for pid=%d on :%d [y/n]", row.PID, row.Port)
+				}
 			}
+			return m, nil
+		}
+		if len(msg.Runes) == 1 && msg.Runes[0] == 'f' && m.forceAvailable {
+			m.awaitingForceConfirm = true
+			m.statusMsg = "force kill is destructive, confirm [y/n]"
 			return m, nil
 		}
 		visible := m.visibleListeners()
@@ -175,7 +232,7 @@ func (m Model) View() string {
 		row := fmt.Sprintf("%s%-7s %-18s %-7d %-14s %-11s %-10s %-11s",
 			prefix,
 			fmt.Sprintf(":%d", item.Port),
-			truncate(item.Process, 18),
+			truncate(renderProcess(item), 18),
 			item.PID,
 			truncate(item.Project, 14),
 			truncate(item.Framework, 11),
@@ -199,6 +256,14 @@ func (m Model) View() string {
 			b.WriteString(m.theme.success.Render(m.statusMsg))
 		}
 		b.WriteString("\n")
+	}
+	if len(m.history) > 0 {
+		b.WriteString("\nRecent actions\n")
+		for _, line := range m.history {
+			b.WriteString("- ")
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
 	}
 	if m.lastError != nil {
 		b.WriteString("\nerror: ")
@@ -276,12 +341,13 @@ func (m Model) renderDetails() string {
 		)
 	}
 	return fmt.Sprintf(
-		"%s\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\n%s",
+		"%s\nPID: %d\nCommand: %s\nExecutable: %s\nUser: %s\nContainer: %s\n%s",
 		m.theme.detailsTitle.Render("Details"),
 		item.PID,
 		item.Command,
 		item.Executable,
 		item.User,
+		containerHintDisplay(item.ContainerHint),
 		restrictionGuidance(item),
 	)
 }
@@ -307,6 +373,20 @@ func (m *Model) restoreSelection() {
 	}
 }
 
+func renderProcess(item discovery.Listener) string {
+	if strings.TrimSpace(item.ContainerHint) == "" {
+		return item.Process
+	}
+	return item.Process + " (" + item.ContainerHint + ")"
+}
+
+func containerHintDisplay(hint string) string {
+	if strings.TrimSpace(hint) == "" {
+		return "-"
+	}
+	return hint
+}
+
 func (m Model) selectedRow() *discovery.Listener {
 	row, ok := m.rowAtCursor()
 	if !ok {
@@ -327,6 +407,72 @@ func restrictionGuidance(item discovery.Listener) string {
 		return ""
 	}
 	return "Guidance: rerun with elevated privileges to control this process.\n"
+}
+
+func (m *Model) applyGracefulStop() {
+	m.awaitingConfirm = false
+	if m.stopper == nil {
+		m.statusMsg = "graceful stop succeeded"
+		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	result := m.stopper.GracefulStop(context.Background(), m.pendingTarget)
+	if result.Err != nil {
+		m.statusMsg = "graceful stop failed"
+		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d error", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	if result.NeedsForce {
+		m.statusMsg = "graceful stop incomplete: port still bound (press [f] to force kill)"
+		m.forceAvailable = true
+		m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d pending-force", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	if m.refreshCoord != nil {
+		m.refreshCoord.MarkTargeted(m.pendingTarget.Port, m.now())
+	}
+	m.forceAvailable = false
+	m.statusMsg = "graceful stop succeeded"
+	m.recordAction(fmt.Sprintf("SIGTERM pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+}
+
+func (m *Model) recordAction(line string) {
+	m.history = append([]string{line}, m.history...)
+	if len(m.history) > 5 {
+		m.history = m.history[:5]
+	}
+}
+
+func (m *Model) applyRebindEvents() {
+	if m.refreshCoord == nil {
+		return
+	}
+	ev := m.refreshCoord.Observe(m.listeners, m.now())
+	if len(ev.ReboundPorts) == 0 {
+		return
+	}
+	m.statusMsg = fmt.Sprintf("warning: likely restart loop; port :%d rebound quickly", ev.ReboundPorts[0])
+	for _, port := range ev.ReboundPorts {
+		m.recordAction(fmt.Sprintf("rebound :%d detected (likely restart loop)", port))
+	}
+}
+
+func (m *Model) applyForceStop() {
+	m.awaitingForceConfirm = false
+	if m.stopper == nil {
+		m.statusMsg = "force kill succeeded"
+		m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+		m.forceAvailable = false
+		return
+	}
+	if err := m.stopper.ForceStop(context.Background(), m.pendingTarget); err != nil {
+		m.statusMsg = "force kill failed"
+		m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d error", m.pendingTarget.PID, m.pendingTarget.Port))
+		return
+	}
+	m.statusMsg = "force kill succeeded"
+	m.recordAction(fmt.Sprintf("SIGKILL pid=%d port=%d success", m.pendingTarget.PID, m.pendingTarget.Port))
+	m.forceAvailable = false
 }
 
 func (m Model) visibleListeners() []discovery.Listener {

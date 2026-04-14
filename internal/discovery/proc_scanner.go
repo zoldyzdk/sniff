@@ -22,6 +22,7 @@ type Listener struct {
 	Command           string
 	Executable        string
 	User              string
+	ContainerHint     string
 	Project           string
 	Framework         string
 	Uptime            string
@@ -49,8 +50,6 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 			return nil, err
 		}
 		for port, inode := range tableInodes {
-			// Prefer first-seen mapping to keep deterministic output when both
-			// tables expose the same listening port.
 			if _, exists := inodesByPort[port]; !exists {
 				inodesByPort[port] = inode
 			}
@@ -75,6 +74,7 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 			Command:           meta.command,
 			Executable:        meta.executable,
 			User:              meta.user,
+			ContainerHint:     meta.containerHint,
 			Project:           meta.project,
 			Framework:         meta.framework,
 			Uptime:            meta.uptime,
@@ -98,6 +98,7 @@ type processMeta struct {
 	command           string
 	executable        string
 	user              string
+	containerHint     string
 	restricted        bool
 	restrictionReason string
 	project           string
@@ -111,6 +112,7 @@ func readProcessMeta(procRoot string, pid int) processMeta {
 		command:           "-",
 		executable:        "-",
 		user:              "-",
+		containerHint:     "",
 		restricted:        false,
 		restrictionReason: "",
 		project:           "-",
@@ -160,7 +162,23 @@ func readProcessMeta(procRoot string, pid int) processMeta {
 			}
 		}
 	}
+	meta.containerHint = detectContainerHint(procRoot, pidStr, meta.process, cmdline)
 	return meta
+}
+
+func detectContainerHint(procRoot, pid, process, cmdline string) string {
+	cgroupPath := filepath.Join(procRoot, pid, "cgroup")
+	if raw, err := os.ReadFile(cgroupPath); err == nil {
+		line := strings.ToLower(string(raw))
+		if strings.Contains(line, "docker") || strings.Contains(line, "containerd") {
+			return "docker"
+		}
+	}
+	joined := strings.ToLower(process + " " + cmdline)
+	if strings.Contains(joined, "docker") || strings.Contains(joined, "containerd") {
+		return "docker"
+	}
+	return ""
 }
 
 func detectFramework(s string) string {
