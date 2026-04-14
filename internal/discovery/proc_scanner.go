@@ -15,13 +15,15 @@ import (
 )
 
 type Listener struct {
-	Port      int
-	Process   string
-	PID       int
-	Project   string
-	Framework string
-	Uptime    string
-	Status    string
+	Port       int
+	Process    string
+	PID        int
+	Command    string
+	Executable string
+	Project    string
+	Framework  string
+	Uptime     string
+	Status     string
 }
 
 type ProcScanner struct {
@@ -63,13 +65,15 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 		}
 		meta := readProcessMeta(s.procRoot, pid)
 		listeners = append(listeners, Listener{
-			Port:      port,
-			Process:   meta.process,
-			PID:       pid,
-			Project:   meta.project,
-			Framework: meta.framework,
-			Uptime:    meta.uptime,
-			Status:    "healthy",
+			Port:       port,
+			Process:    meta.process,
+			PID:        pid,
+			Command:    meta.command,
+			Executable: meta.executable,
+			Project:    meta.project,
+			Framework:  meta.framework,
+			Uptime:     meta.uptime,
+			Status:     "healthy",
 		})
 	}
 
@@ -83,18 +87,22 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 }
 
 type processMeta struct {
-	process   string
-	project   string
-	framework string
-	uptime    string
+	process    string
+	command    string
+	executable string
+	project    string
+	framework  string
+	uptime     string
 }
 
 func readProcessMeta(procRoot string, pid int) processMeta {
 	meta := processMeta{
-		process:   "unknown",
-		project:   "-",
-		framework: "-",
-		uptime:    "-",
+		process:    "unknown",
+		command:    "-",
+		executable: "-",
+		project:    "-",
+		framework:  "-",
+		uptime:     "-",
 	}
 
 	pidStr := strconv.Itoa(pid)
@@ -111,6 +119,13 @@ func readProcessMeta(procRoot string, pid int) processMeta {
 	if raw, err := os.ReadFile(cmdlinePath); err == nil {
 		cmdline = strings.ReplaceAll(string(raw), "\x00", " ")
 		cmdline = strings.TrimSpace(cmdline)
+		if cmdline != "" {
+			meta.command = cmdline
+		}
+	}
+	exePath := filepath.Join(procRoot, pidStr, "exe")
+	if exe, err := os.Readlink(exePath); err == nil && strings.TrimSpace(exe) != "" {
+		meta.executable = exe
 	}
 
 	cwdPath := filepath.Join(procRoot, pidStr, "cwd")
