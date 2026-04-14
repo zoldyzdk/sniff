@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type Listener struct {
 	PID        int
 	Command    string
 	Executable string
+	User       string
 	Project    string
 	Framework  string
 	Uptime     string
@@ -45,8 +47,6 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 			return nil, err
 		}
 		for port, inode := range tableInodes {
-			// Prefer first-seen mapping to keep deterministic output when both
-			// tables expose the same listening port.
 			if _, exists := inodesByPort[port]; !exists {
 				inodesByPort[port] = inode
 			}
@@ -70,6 +70,7 @@ func (s *ProcScanner) ScanListeningTCP(ctx context.Context) ([]Listener, error) 
 			PID:        pid,
 			Command:    meta.command,
 			Executable: meta.executable,
+			User:       meta.user,
 			Project:    meta.project,
 			Framework:  meta.framework,
 			Uptime:     meta.uptime,
@@ -90,6 +91,7 @@ type processMeta struct {
 	process    string
 	command    string
 	executable string
+	user       string
 	project    string
 	framework  string
 	uptime     string
@@ -100,6 +102,7 @@ func readProcessMeta(procRoot string, pid int) processMeta {
 		process:    "unknown",
 		command:    "-",
 		executable: "-",
+		user:       "-",
 		project:    "-",
 		framework:  "-",
 		uptime:     "-",
@@ -138,6 +141,11 @@ func readProcessMeta(procRoot string, pid int) processMeta {
 
 	meta.framework = detectFramework(meta.process + " " + cmdline)
 	meta.uptime = readUptime(procRoot, pidStr)
+	if info, err := os.Stat(filepath.Join(procRoot, pidStr)); err == nil {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			meta.user = strconv.FormatUint(uint64(stat.Uid), 10)
+		}
+	}
 	return meta
 }
 
