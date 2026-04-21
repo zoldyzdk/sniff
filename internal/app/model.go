@@ -220,7 +220,7 @@ func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(m.theme.searchLabel.Render(fmt.Sprintf("Search: %s", m.search)))
 	b.WriteString("\n")
-	b.WriteString(m.theme.header.Render(fmt.Sprintf("%-7s %-18s %-7s %-14s %-11s %-10s %-11s",
+	b.WriteString(m.theme.header.Render(fmt.Sprintf("  %-7s %-18s %-7s %-14s %-11s %-10s %-11s",
 		"PORT", "PROCESS", "PID", "PROJECT", "FRAMEWORK", "UPTIME", "STATUS")))
 	b.WriteString("\n")
 	visible := m.visibleListeners()
